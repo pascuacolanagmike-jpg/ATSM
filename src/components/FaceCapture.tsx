@@ -118,11 +118,14 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
       // 1. Load models
       await getFaceLandmarker();
       
-      // 2. Run TinyFaceDetector (not SSD)
+            // 2. Run TinyFaceDetector (not SSD)
       console.log("Running TinyFaceDetector...");
+      
+      const options = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+      
       const detection = await faceapi
-        .detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions())
-        .withFaceLandmarks()
+        .detectSingleFace(canvas, options)
+        .withFaceLandmarks() // this will now use the TinyFaceDetector landmarks
         .withFaceDescriptor();
 
       if (!detection) {
