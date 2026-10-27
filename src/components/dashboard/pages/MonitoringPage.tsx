@@ -30,8 +30,11 @@ export default function MonitoringPage() {
   >([]);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState('');
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  
+  // NEW: WebSocket and Canvas refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [liveTime, setLiveTime] = useState(new Date());
 
@@ -45,19 +48,6 @@ export default function MonitoringPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---------------------------------------------------------------- */
-  /* Attach stream only once <video> is mounted                       */
-  /* ---------------------------------------------------------------- */
-  useEffect(() => {
-    if (cameraActive && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      videoRef.current.play().catch((e) => {
-        console.error('video.play() failed:', e);
-        setCameraError(`Cannot play video: ${(e as Error).message}`);
-      });
-    }
-  }, [cameraActive]);
-
   const loadStudents = async () => {
     const { data } = await supabase
       .from('students')
@@ -67,54 +57,82 @@ export default function MonitoringPage() {
     if (data) setStudents(data);
   };
 
-  const startCamera = async () => {
+  // NEW: Connect to Render Backend via WebSocket
+  const connectWebSocket = useCallback(() => {
+    // Use wss:// for secure connection to Render
+    const ws = new WebSocket('wss://atsm.onrender.com');
+    ws.binaryType = 'arraybuffer'; // Expecting binary JPEGs
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('WebSocket connected to Render backend');
+      setCameraError('');
+    };
+
+    ws.onmessage = (event) => {
+      // If it's a string, it's a JSON event (e.g., attendance matched)
+      if (typeof event.data === 'string') {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'attendance_matched') {
+             // Handle future face-recognition events here
+          }
+        } catch (e) {
+          console.error('Error parsing WS message', e);
+        }
+        return;
+      }
+
+      // If it's binary, it's a JPEG frame from the ESP32
+      if (event.data instanceof ArrayBuffer) {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        
+        const blob = new Blob([event.data], { type: 'image/jpeg' });
+        const imageUrl = URL.createObjectURL(blob);
+        const img = new Image();
+
+        img.onload = () => {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          ctx?.drawImage(img, 0, 0);
+          URL.revokeObjectURL(imageUrl); // Prevent memory leaks
+        };
+        img.src = imageUrl;
+      }
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected. Reconnecting in 5s...');
+      // Auto-reconnect loop (important for Render Free Tier)
+      reconnectTimerRef.current = setTimeout(connectWebSocket, 5000);
+    };
+
+    ws.onerror = (err) => {
+      console.error('WebSocket Error:', err);
+    };
+  }, []);
+
+  const startCamera = () => {
     setCameraError('');
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError(
-        'Camera requires HTTPS or localhost. Your browser blocks camera on insecure http:// connections.'
-      );
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-        },
-        audio: false,
-      });
-      streamRef.current = stream;
-      setCameraActive(true);
-    } catch (err) {
-      const msg = (err as Error)?.message ?? String(err);
-      const name = (err as DOMException)?.name ?? '';
-
-      setCameraError(
-        name === 'NotAllowedError' || msg.toLowerCase().includes('permission')
-          ? 'Camera permission denied. Allow access in your browser and try again.'
-          : name === 'NotFoundError' || msg.toLowerCase().includes('not found')
-          ? 'No camera detected on this device.'
-          : name === 'NotReadableError'
-          ? 'Camera is in use by another app (Zoom, Teams, etc.). Close it and retry.'
-          : `Camera error (${name || 'unknown'}): ${msg}`
-      );
-    }
+    setCameraActive(true);
+    connectWebSocket();
   };
 
   const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.onclose = null; // Prevent reconnect on manual close
+      wsRef.current.close();
+      wsRef.current = null;
     }
     if (scanTimerRef.current) {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
     }
     setCameraActive(false);
     setScanState('idle');
@@ -122,6 +140,7 @@ export default function MonitoringPage() {
     setConfidence(0);
   };
 
+  // Simulated scan logic (same as before)
   const startScan = useCallback(() => {
     if (students.length === 0) return;
 
@@ -182,7 +201,6 @@ export default function MonitoringPage() {
       .maybeSingle();
 
     let saved = false;
-    // Track which slot was just filled so the SMS picks the right template
     let slotUsed: 'time_in_am' | 'time_out_am' | 'time_in_pm' | 'time_out_pm' | null = null;
 
     if (existing) {
@@ -233,7 +251,6 @@ export default function MonitoringPage() {
       saved = !error;
     }
 
-    // Fire SMS only if the DB write succeeded AND we know which slot was filled
     if (saved && slotUsed) {
       void sendAttendanceSMS(student.phone, student.full_name, slotUsed);
     }
@@ -282,12 +299,10 @@ export default function MonitoringPage() {
             <div className="relative aspect-video bg-gray-900 overflow-hidden">
               {cameraActive ? (
                 <>
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    className="w-full h-full object-cover scale-x-[-1]"
-                    muted
-                    playsInline
+                  {/* REPLACED VIDEO WITH CANVAS */}
+                  <canvas
+                    ref={canvasRef}
+                    className="w-full h-full object-cover"
                   />
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                     <div className="relative w-48 h-48">
@@ -352,14 +367,14 @@ export default function MonitoringPage() {
 
                   <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-red-600 rounded-full">
                     <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
-                    <span className="text-white text-xs font-bold">LIVE</span>
+                    <span className="text-white text-xs font-bold">LIVE ESP32</span>
                   </div>
                 </>
               ) : (
                 <div className="flex flex-col items-center justify-center h-full text-gray-400">
                   <Camera className="w-16 h-16 mb-4 opacity-50" />
-                  <p className="text-sm font-medium">Camera is off</p>
-                  <p className="text-xs mt-1">Click "Start Camera" to begin</p>
+                  <p className="text-sm font-medium">ESP32 Camera is off</p>
+                  <p className="text-xs mt-1">Click "Start Camera" to connect to the stream</p>
                 </div>
               )}
             </div>
@@ -382,7 +397,7 @@ export default function MonitoringPage() {
                       className="inline-flex items-center gap-2 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold rounded-lg transition-colors disabled:opacity-50"
                     >
                       <Play className="w-4 h-4" />
-                      Scan Face
+                      Simulate Scan
                     </button>
                     <button
                       onClick={stopCamera}
@@ -397,7 +412,7 @@ export default function MonitoringPage() {
               {cameraActive && (
                 <div className="flex items-center gap-2 text-sm text-gray-500">
                   <AlertCircle className="w-4 h-4" />
-                  {students.length} students in database
+                  Connected to Live Stream
                 </div>
               )}
             </div>
