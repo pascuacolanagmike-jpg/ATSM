@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { sendAttendanceSMS } from '@/lib/sms';
 import {
-  ScanFace,
-  Play,
   Square,
   Camera,
   CheckCircle2,
@@ -17,13 +15,12 @@ import { supabase } from '@/lib/supabase';
 import { todayDate, formatTime, isAM, statusForScan } from '@/lib/utils';
 import type { Student, AttendanceRecord } from '@/types';
 
-type ScanState = 'idle' | 'scanning' | 'matched' | 'no-match';
+type ScanState = 'idle' | 'matched' | 'no-match';
 
 export default function MonitoringPage() {
   const [students, setStudents] = useState<Student[]>([]);
   const [scanState, setScanState] = useState<ScanState>('idle');
   const [matchedStudent, setMatchedStudent] = useState<Student | null>(null);
-  const [scanProgress, setScanProgress] = useState(0);
   const [confidence, setConfidence] = useState(0);
   const [recentScans, setRecentScans] = useState<
     { student: Student; status: string; time: string; confidence: number }[]
@@ -31,12 +28,14 @@ export default function MonitoringPage() {
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState('');
   
-  // NEW: WebSocket and Canvas refs
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [liveTime, setLiveTime] = useState(new Date());
+
+  // Use a ref for students so the WebSocket closure always has the latest list
+  const studentsRef = useRef<Student[]>([]);
+  useEffect(() => { studentsRef.current = students; }, [students]);
 
   useEffect(() => {
     loadStudents();
@@ -57,11 +56,9 @@ export default function MonitoringPage() {
     if (data) setStudents(data);
   };
 
-  // NEW: Connect to Render Backend via WebSocket
   const connectWebSocket = useCallback(() => {
-    // Use wss:// for secure connection to Render
     const ws = new WebSocket('wss://atsm.onrender.com');
-    ws.binaryType = 'arraybuffer'; // Expecting binary JPEGs
+    ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -70,12 +67,39 @@ export default function MonitoringPage() {
     };
 
     ws.onmessage = (event) => {
-      // If it's a string, it's a JSON event (e.g., attendance matched)
+      // Handle AI Match Event from Server
       if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data);
+          
           if (msg.type === 'attendance_matched') {
-             // Handle future face-recognition events here
+            // Find student in our current list
+            const matched = studentsRef.current.find((s) => s.id === msg.studentId);
+            
+            if (matched) {
+              setMatchedStudent(matched);
+              setScanState('matched');
+              setConfidence(Math.round(msg.confidence * 100));
+              
+              logAttendance(matched);
+              
+              setRecentScans((prev) => [
+                {
+                  student: matched,
+                  status: 'present',
+                  time: new Date().toISOString(),
+                  confidence: Math.round(msg.confidence * 100),
+                },
+                ...prev,
+              ].slice(0, 15));
+
+              // Reset UI after 4 seconds
+              setTimeout(() => {
+                setScanState('idle');
+                setMatchedStudent(null);
+                setConfidence(0);
+              }, 4000);
+            }
           }
         } catch (e) {
           console.error('Error parsing WS message', e);
@@ -83,7 +107,7 @@ export default function MonitoringPage() {
         return;
       }
 
-      // If it's binary, it's a JPEG frame from the ESP32
+      // Handle Binary JPEG Frames
       if (event.data instanceof ArrayBuffer) {
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -97,7 +121,7 @@ export default function MonitoringPage() {
           canvas.width = img.width;
           canvas.height = img.height;
           ctx?.drawImage(img, 0, 0);
-          URL.revokeObjectURL(imageUrl); // Prevent memory leaks
+          URL.revokeObjectURL(imageUrl);
         };
         img.src = imageUrl;
       }
@@ -105,7 +129,6 @@ export default function MonitoringPage() {
 
     ws.onclose = () => {
       console.log('WebSocket disconnected. Reconnecting in 5s...');
-      // Auto-reconnect loop (important for Render Free Tier)
       reconnectTimerRef.current = setTimeout(connectWebSocket, 5000);
     };
 
@@ -126,67 +149,14 @@ export default function MonitoringPage() {
       reconnectTimerRef.current = null;
     }
     if (wsRef.current) {
-      wsRef.current.onclose = null; // Prevent reconnect on manual close
+      wsRef.current.onclose = null;
       wsRef.current.close();
       wsRef.current = null;
     }
-    if (scanTimerRef.current) {
-      clearInterval(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
     setCameraActive(false);
     setScanState('idle');
-    setScanProgress(0);
     setConfidence(0);
   };
-
-  // Simulated scan logic (same as before)
-  const startScan = useCallback(() => {
-    if (students.length === 0) return;
-
-    setScanState('scanning');
-    setScanProgress(0);
-    setConfidence(0);
-    setMatchedStudent(null);
-
-    let progress = 0;
-    scanTimerRef.current = setInterval(() => {
-      progress += 5;
-      setScanProgress(progress);
-      setConfidence(Math.min(98, Math.round(85 + Math.random() * 14)));
-
-      if (progress >= 100) {
-        if (scanTimerRef.current) clearInterval(scanTimerRef.current);
-        scanTimerRef.current = null;
-
-        const student = students[Math.floor(Math.random() * students.length)];
-        setMatchedStudent(student);
-        setScanState('matched');
-        setConfidence(Math.round(94 + Math.random() * 5));
-
-        logAttendance(student);
-
-        setRecentScans((prev) =>
-          [
-            {
-              student,
-              status: 'present',
-              time: new Date().toISOString(),
-              confidence: Math.round(94 + Math.random() * 5),
-            },
-            ...prev,
-          ].slice(0, 15)
-        );
-
-        setTimeout(() => {
-          setScanState('idle');
-          setScanProgress(0);
-          setMatchedStudent(null);
-          setConfidence(0);
-        }, 4000);
-      }
-    }, 100);
-  }, [students]);
 
   const logAttendance = async (student: Student) => {
     const today = todayDate();
@@ -261,7 +231,6 @@ export default function MonitoringPage() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h3 className="text-xl font-bold text-gray-900">Live Face Monitoring</h3>
@@ -293,13 +262,11 @@ export default function MonitoringPage() {
       </div>
 
       <div className="grid lg:grid-cols-3 gap-6">
-        {/* Camera / Scanner */}
         <div className="lg:col-span-2">
           <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
             <div className="relative aspect-video bg-gray-900 overflow-hidden">
               {cameraActive ? (
                 <>
-                  {/* REPLACED VIDEO WITH CANVAS */}
                   <canvas
                     ref={canvasRef}
                     className="w-full h-full object-cover"
@@ -310,26 +277,8 @@ export default function MonitoringPage() {
                       <div className="absolute top-0 right-0 w-8 h-8 border-t-4 border-r-4 border-brand-400 rounded-tr-lg" />
                       <div className="absolute bottom-0 left-0 w-8 h-8 border-b-4 border-l-4 border-brand-400 rounded-bl-lg" />
                       <div className="absolute bottom-0 right-0 w-8 h-8 border-b-4 border-r-4 border-brand-400 rounded-br-lg" />
-                      {scanState === 'scanning' && <div className="scan-line" />}
                     </div>
                   </div>
-
-                  {scanState === 'scanning' && (
-                    <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-gray-900 to-transparent p-6">
-                      <div className="flex items-center gap-3 mb-3">
-                        <ScanFace className="w-5 h-5 text-brand-400 animate-pulse" />
-                        <span className="text-white font-semibold text-sm">
-                          Scanning... {scanProgress}%
-                        </span>
-                      </div>
-                      <div className="w-full h-2 bg-white/20 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-brand-400 rounded-full transition-all duration-100"
-                          style={{ width: `${scanProgress}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
 
                   {scanState === 'matched' && matchedStudent && (
                     <div className="absolute inset-0 bg-emerald-900/80 flex items-center justify-center animate-fade-in">
@@ -390,23 +339,13 @@ export default function MonitoringPage() {
                     Start Camera
                   </button>
                 ) : (
-                  <>
-                    <button
-                      onClick={startScan}
-                      disabled={scanState === 'scanning'}
-                      className="inline-flex items-center gap-2 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold rounded-lg transition-colors disabled:opacity-50"
-                    >
-                      <Play className="w-4 h-4" />
-                      Simulate Scan
-                    </button>
-                    <button
-                      onClick={stopCamera}
-                      className="inline-flex items-center gap-2 px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-semibold rounded-lg transition-colors"
-                    >
-                      <Square className="w-4 h-4" />
-                      Stop
-                    </button>
-                  </>
+                  <button
+                    onClick={stopCamera}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-semibold rounded-lg transition-colors"
+                  >
+                    <Square className="w-4 h-4" />
+                    Stop
+                  </button>
                 )}
               </div>
               {cameraActive && (
@@ -430,7 +369,6 @@ export default function MonitoringPage() {
           </div>
         </div>
 
-        {/* Recent scans sidebar */}
         <div className="bg-white rounded-2xl border border-gray-100 p-5">
           <div className="flex items-center justify-between mb-4">
             <h4 className="font-bold text-gray-900 text-sm">Recent Scans</h4>
@@ -482,27 +420,14 @@ export default function MonitoringPage() {
   );
 }
 
-function SessionTimer({
-  label,
-  period,
-  icon: Icon,
-  liveTime,
-}: {
-  label: string;
-  period: string;
-  icon: typeof Sun;
-  liveTime: Date;
-}) {
-  const isActive =
-    (period === 'AM' && isAM(liveTime)) || (period === 'PM' && !isAM(liveTime));
+function SessionTimer({ label, period, icon: Icon, liveTime }: { label: string; period: string; icon: typeof Sun; liveTime: Date; }) {
+  const isActive = (period === 'AM' && isAM(liveTime)) || (period === 'PM' && !isAM(liveTime));
   const periodStart = period === 'AM' ? 8 : 13;
   const periodEnd = period === 'AM' ? 12 : 17;
 
   const now = liveTime;
-  const start = new Date(now);
-  start.setHours(periodStart, 0, 0, 0);
-  const end = new Date(now);
-  end.setHours(periodEnd, 0, 0, 0);
+  const start = new Date(now); start.setHours(periodStart, 0, 0, 0);
+  const end = new Date(now); end.setHours(periodEnd, 0, 0, 0);
 
   const elapsed = now > start ? now.getTime() - start.getTime() : 0;
   const total = end.getTime() - start.getTime();
@@ -517,50 +442,30 @@ function SessionTimer({
   };
 
   return (
-    <div
-      className={`rounded-xl p-4 border transition-all ${
-        isActive ? 'bg-brand-50 border-brand-200' : 'bg-gray-50 border-gray-100'
-      }`}
-    >
+    <div className={`rounded-xl p-4 border transition-all ${isActive ? 'bg-brand-50 border-brand-200' : 'bg-gray-50 border-gray-100'}`}>
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <Icon className={`w-4 h-4 ${isActive ? 'text-brand-600' : 'text-gray-400'}`} />
-          <span
-            className={`text-sm font-semibold ${isActive ? 'text-brand-700' : 'text-gray-500'}`}
-          >
-            {label}
-          </span>
+          <span className={`text-sm font-semibold ${isActive ? 'text-brand-700' : 'text-gray-500'}`}>{label}</span>
         </div>
         {isActive && (
           <span className="flex items-center gap-1 text-xs text-brand-600 font-medium">
-            <span className="w-1.5 h-1.5 bg-brand-500 rounded-full animate-pulse" />
-            Active
+            <span className="w-1.5 h-1.5 bg-brand-500 rounded-full animate-pulse" /> Active
           </span>
         )}
       </div>
       <div className="grid grid-cols-2 gap-3 mt-3">
         <div>
           <p className="text-xs text-gray-400">Elapsed</p>
-          <p
-            className={`text-sm font-bold tabular-nums ${isActive ? 'text-brand-700' : 'text-gray-600'}`}
-          >
-            {formatDuration(elapsed)}
-          </p>
+          <p className={`text-sm font-bold tabular-nums ${isActive ? 'text-brand-700' : 'text-gray-600'}`}>{formatDuration(elapsed)}</p>
         </div>
         <div>
           <p className="text-xs text-gray-400">Remaining</p>
-          <p
-            className={`text-sm font-bold tabular-nums ${isActive ? 'text-brand-700' : 'text-gray-600'}`}
-          >
-            {formatDuration(remaining)}
-          </p>
+          <p className={`text-sm font-bold tabular-nums ${isActive ? 'text-brand-700' : 'text-gray-600'}`}>{formatDuration(remaining)}</p>
         </div>
       </div>
       <div className="mt-3 h-1.5 bg-gray-200 rounded-full overflow-hidden">
-        <div
-          className={`h-full rounded-full transition-all ${isActive ? 'bg-brand-500' : 'bg-gray-300'}`}
-          style={{ width: `${progress}%` }}
-        />
+        <div className={`h-full rounded-full transition-all ${isActive ? 'bg-brand-500' : 'bg-gray-300'}`} style={{ width: `${progress}%` }} />
       </div>
     </div>
   );
