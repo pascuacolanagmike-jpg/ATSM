@@ -12,7 +12,6 @@ interface FaceCaptureProps {
   ) => void;
 }
 
-// Global singletons so the model is only downloaded once per session
 let faceLandmarker: FaceLandmarker | null = null;
 let visionLoading: Promise<FaceLandmarker> | null = null;
 let faceApiLoaded = false;
@@ -21,24 +20,25 @@ async function getFaceLandmarker(): Promise<FaceLandmarker> {
   if (faceLandmarker) return faceLandmarker;
   if (!visionLoading) {
     visionLoading = (async () => {
+      // 1. Load MediaPipe for UI tracking
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm'
       );
       faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: '/models/face_landmarker.task',
-        },
+        baseOptions: { modelAssetPath: '/models/face_landmarker.task' },
         runningMode: 'IMAGE',
         numFaces: 1,
       });
       
-      // Load face-api models for actual recognition
+      // 2. Load face-api.js ONLY TinyFaceDetector & Recognition
       if (!faceApiLoaded) {
-        await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+        console.log("Loading face-api models...");
+        await faceapi.nets.tinyFaceDetector.loadFromUri('/models');
         await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
+        await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
         faceApiLoaded = true;
+        console.log("face-api models loaded successfully!");
       }
-      
       return faceLandmarker;
     })();
   }
@@ -91,16 +91,14 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
     const video = videoRef.current;
     if (!video) return;
     setProcessing(true);
+    setError('');
 
     const size = Math.min(video.videoWidth, video.videoHeight);
     const canvas = document.createElement('canvas');
     canvas.width = 512;
     canvas.height = 512;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      setProcessing(false);
-      return;
-    }
+    if (!ctx) return;
 
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
@@ -117,35 +115,28 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
     );
 
     try {
-      const landmarker = await getFaceLandmarker();
-      const result = landmarker.detect(canvas);
-
-      if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
-        setError('No face detected. Look straight at the camera.');
-        setProcessing(false);
-        return;
-      }
-
-      // Extract the 128-length descriptor using face-api
+      // 1. Load models
+      await getFaceLandmarker();
+      
+      // 2. Run TinyFaceDetector (not SSD)
+      console.log("Running TinyFaceDetector...");
       const detection = await faceapi
-        .detectSingleFace(canvas)
+        .detectSingleFace(canvas, new faceapi.TinyFaceDetectorOptions())
         .withFaceLandmarks()
         .withFaceDescriptor();
 
       if (!detection) {
-        setError('Face too blurry or unclear. Please try again.');
+        setError('No face detected. Look straight at the camera in good lighting.');
         setProcessing(false);
         return;
       }
 
+      console.log("Face detected! Descriptor generated.");
       const descriptor = detection.descriptor;
 
       canvas.toBlob(
         (blob) => {
-          if (!blob) {
-            setProcessing(false);
-            return;
-          }
+          if (!blob) return;
           const url = URL.createObjectURL(blob);
           setPreview(url);
           onChange(blob, url, descriptor);
@@ -156,7 +147,7 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
         0.9
       );
     } catch (err) {
-      console.error(err);
+      console.error("Capture error:", err);
       setError('Error processing face.');
       setProcessing(false);
     }

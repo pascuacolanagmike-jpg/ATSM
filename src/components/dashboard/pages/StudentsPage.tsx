@@ -231,7 +231,7 @@ export default function StudentsPage() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Student Modal — includes face capture, landmarks, and upload        */
+/* Student Modal — includes face capture, descriptors, and upload      */
 /* ------------------------------------------------------------------ */
 
 function StudentModal({
@@ -254,7 +254,7 @@ function StudentModal({
   });
 
   const [faceBlob, setFaceBlob] = useState<Blob | null>(null);
-  const [faceLandmarks, setFaceLandmarks] = useState<any | null>(null);
+  const [faceDescriptor, setFaceDescriptor] = useState<Float32Array | null>(null);
   const [faceRemoved, setFaceRemoved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -262,10 +262,10 @@ function StudentModal({
   const handleFaceChange = (
     blob: Blob | null,
     previewUrl: string | null,
-    landmarks: any | null
+    descriptor: Float32Array | null
   ) => {
     setFaceBlob(blob);
-    setFaceLandmarks(landmarks ?? null);
+    setFaceDescriptor(descriptor);
     setFaceRemoved(!blob && !previewUrl && !!student?.photo_url);
   };
 
@@ -281,9 +281,8 @@ function StudentModal({
 
     try {
       let photoUrl: string | null = student?.photo_url ?? null;
-      // Keep whatever is already stored unless we're replacing it
-      let landmarksToSave: any | null =
-        (student as any)?.face_landmarks ?? null;
+      // Keep existing descriptor unless we're capturing a new face
+      let descriptorToSave: number[] | null = (student as any)?.face_descriptor ?? null;
 
       if (faceBlob) {
         const ext = faceBlob.type === 'image/png' ? 'png' : 'jpg';
@@ -302,10 +301,14 @@ function StudentModal({
           .from('student-photos')
           .getPublicUrl(path);
         photoUrl = data.publicUrl;
-        landmarksToSave = faceLandmarks;
+        
+        // Convert Float32Array to normal Array for Supabase JSONB
+        if (faceDescriptor) {
+          descriptorToSave = Array.from(faceDescriptor);
+        }
       } else if (faceRemoved) {
         photoUrl = null;
-        landmarksToSave = null;
+        descriptorToSave = null;
       }
 
       const payload = {
@@ -313,7 +316,7 @@ function StudentModal({
         email: form.email.trim() || null,
         phone: form.phone.trim() || null,
         photo_url: photoUrl,
-        face_landmarks: landmarksToSave,
+        face_descriptor: descriptorToSave,
       };
 
       if (student) {
@@ -351,13 +354,11 @@ function StudentModal({
 
         <div className="p-6">
           <div className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-6">
-            {/* Face panel — now passes landmarks back via 3rd arg */}
             <FaceCapture
               initialUrl={student?.photo_url ?? null}
               onChange={handleFaceChange}
             />
 
-            {/* Fields */}
             <div className="grid grid-cols-2 gap-4">
               <Field label="Student Number" required>
                 <input
