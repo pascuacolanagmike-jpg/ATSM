@@ -1,19 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Camera, RotateCcw, X, Loader2 } from 'lucide-react';
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import * as faceapi from '@vladmandic/face-api';
 
 interface FaceCaptureProps {
   initialUrl?: string | null;
   onChange: (
     blob: Blob | null,
     previewUrl: string | null,
-    landmarks: any | null
+    descriptor: Float32Array | null
   ) => void;
 }
 
 // Global singletons so the model is only downloaded once per session
 let faceLandmarker: FaceLandmarker | null = null;
 let visionLoading: Promise<FaceLandmarker> | null = null;
+let faceApiLoaded = false;
 
 async function getFaceLandmarker(): Promise<FaceLandmarker> {
   if (faceLandmarker) return faceLandmarker;
@@ -29,6 +31,14 @@ async function getFaceLandmarker(): Promise<FaceLandmarker> {
         runningMode: 'IMAGE',
         numFaces: 1,
       });
+      
+      // Load face-api models for actual recognition
+      if (!faceApiLoaded) {
+        await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+        await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
+        faceApiLoaded = true;
+      }
+      
       return faceLandmarker;
     })();
   }
@@ -51,7 +61,6 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
     setStreaming(false);
   }, []);
 
-  // Ensure the video element is ready before we attach the stream
   useEffect(() => {
     if (streaming && videoRef.current && streamRef.current) {
       videoRef.current.srcObject = streamRef.current;
@@ -66,15 +75,11 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
     setStarting(true);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 640 },
-        },
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 640 } },
         audio: false,
       });
       streamRef.current = stream;
-      setStreaming(true); // This triggers the useEffect above
+      setStreaming(true);
     } catch (e) {
       setError((e as Error)?.message ?? 'Cannot access camera');
     } finally {
@@ -87,7 +92,6 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
     if (!video) return;
     setProcessing(true);
 
-    // --- 1. Build a square, non‑mirrored canvas snapshot ---
     const size = Math.min(video.videoWidth, video.videoHeight);
     const canvas = document.createElement('canvas');
     canvas.width = 512;
@@ -98,8 +102,6 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
       return;
     }
 
-    // Because the preview is mirrored via CSS, we flip the canvas horizontally
-    // so the saved image matches the *real* orientation of the student's face.
     ctx.translate(canvas.width, 0);
     ctx.scale(-1, 1);
     ctx.drawImage(
@@ -114,38 +116,50 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
       512
     );
 
-    // --- 2. Run MediaPipe on the *un‑mirrored* canvas ---
-    const landmarker = await getFaceLandmarker();
-    const result = landmarker.detect(canvas);
+    try {
+      const landmarker = await getFaceLandmarker();
+      const result = landmarker.detect(canvas);
 
-    let landmarks: any | null = null;
-    if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-      // array of {x, y, z} for 478 points
-      landmarks = result.faceLandmarks[0];
-    } else {
-      setError(
-        'No face detected. Make sure the student is looking at the camera in good lighting.'
-      );
-      setProcessing(false);
-      return;
-    }
-
-    // --- 3. Produce the final Blob and notify parent ---
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) {
-          setProcessing(false);
-          return;
-        }
-        const url = URL.createObjectURL(blob);
-        setPreview(url);
-        onChange(blob, url, landmarks);
-        stopCamera();
+      if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
+        setError('No face detected. Look straight at the camera.');
         setProcessing(false);
-      },
-      'image/jpeg',
-      0.9
-    );
+        return;
+      }
+
+      // Extract the 128-length descriptor using face-api
+      const detection = await faceapi
+        .detectSingleFace(canvas)
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+
+      if (!detection) {
+        setError('Face too blurry or unclear. Please try again.');
+        setProcessing(false);
+        return;
+      }
+
+      const descriptor = detection.descriptor;
+
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) {
+            setProcessing(false);
+            return;
+          }
+          const url = URL.createObjectURL(blob);
+          setPreview(url);
+          onChange(blob, url, descriptor);
+          stopCamera();
+          setProcessing(false);
+        },
+        'image/jpeg',
+        0.9
+      );
+    } catch (err) {
+      console.error(err);
+      setError('Error processing face.');
+      setProcessing(false);
+    }
   };
 
   const clear = () => {
@@ -161,85 +175,35 @@ export default function FaceCapture({ initialUrl, onChange }: FaceCaptureProps) 
   return (
     <div>
       <label className="block text-xs font-semibold text-gray-500 mb-1.5">
-        Face Photo & Landmarks
+        Face Photo & Recognition Data
       </label>
 
       <div className="relative aspect-square w-full max-w-[220px] mx-auto rounded-2xl overflow-hidden bg-gray-900 border border-gray-200">
         {preview ? (
           <>
-            <img
-              src={preview}
-              alt="Captured face"
-              className="w-full h-full object-cover"
-            />
-            <button
-              type="button"
-              onClick={retake}
-              className="absolute bottom-2 left-2 right-2 px-3 py-2 bg-white/95 hover:bg-white text-gray-800 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5"
-            >
+            <img src={preview} alt="Captured face" className="w-full h-full object-cover" />
+            <button type="button" onClick={retake} className="absolute bottom-2 left-2 right-2 px-3 py-2 bg-white/95 hover:bg-white text-gray-800 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5">
               <RotateCcw className="w-3.5 h-3.5" /> Retake
             </button>
-            <button
-              type="button"
-              onClick={clear}
-              className="absolute top-2 right-2 p-1.5 bg-white/95 hover:bg-white rounded-lg"
-            >
+            <button type="button" onClick={clear} className="absolute top-2 right-2 p-1.5 bg-white/95 hover:bg-white rounded-lg">
               <X className="w-3.5 h-3.5 text-gray-700" />
             </button>
           </>
         ) : streaming ? (
           <>
-            {/* The CSS class "scale-x-[-1]" (Tailwind) mirrors the preview so it feels like a mirror.
-                The actual canvas capture is un-mirrored in the code above. */}
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover scale-x-[-1]"
-            />
-            <button
-              type="button"
-              onClick={capture}
-              disabled={processing}
-              className="absolute bottom-2 left-2 right-2 px-3 py-2 bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 disabled:opacity-50"
-            >
-              {processing ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Processing…
-                </>
-              ) : (
-                <>
-                  <Camera className="w-3.5 h-3.5" /> Capture
-                </>
-              )}
+            <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover scale-x-[-1]" />
+            <button type="button" onClick={capture} disabled={processing} className="absolute bottom-2 left-2 right-2 px-3 py-2 bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 disabled:opacity-50">
+              {processing ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Processing…</> : <><Camera className="w-3.5 h-3.5" /> Capture</>}
             </button>
           </>
         ) : (
-          <button
-            type="button"
-            onClick={startCamera}
-            disabled={starting}
-            className="w-full h-full flex flex-col items-center justify-center gap-2 text-gray-300 hover:bg-gray-800 transition-colors"
-          >
-            {starting ? (
-              <Loader2 className="w-8 h-8 animate-spin" />
-            ) : (
-              <Camera className="w-8 h-8" />
-            )}
-            <span className="text-xs font-medium">
-              {starting ? 'Starting…' : 'Open Camera'}
-            </span>
+          <button type="button" onClick={startCamera} disabled={starting} className="w-full h-full flex flex-col items-center justify-center gap-2 text-gray-300 hover:bg-gray-800 transition-colors">
+            {starting ? <Loader2 className="w-8 h-8 animate-spin" /> : <Camera className="w-8 h-8" />}
+            <span className="text-xs font-medium">{starting ? 'Starting…' : 'Open Camera'}</span>
           </button>
         )}
       </div>
-
-      <p className="text-[11px] text-gray-400 text-center mt-2 leading-tight">
-        Look straight at the camera in good lighting.
-      </p>
-      {error && (
-        <p className="text-[11px] text-red-500 text-center mt-1">{error}</p>
-      )}
+      {error && <p className="text-[11px] text-red-500 text-center mt-1">{error}</p>}
     </div>
   );
 }

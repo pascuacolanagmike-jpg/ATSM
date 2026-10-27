@@ -7,6 +7,9 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "canvas": "^3.2.3",
     "ws": "^8.18.0"
   }
 }
