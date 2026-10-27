@@ -36,7 +36,7 @@ export default function MonitoringPage() {
 
   const connectWebSocket = useCallback(() => {
     // ⚠️ NAKA-CONNECT NA ITO SA COLAB MO ⚠️
-    const ws = new WebSocket('wss://petal-brittle-fretful.ngrok-free.dev');
+   const ws = new WebSocket('wss://petal-brittle-fretful.ngrok-free.dev/ws');
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
